@@ -177,3 +177,43 @@ pub fn row_count(batches: &[RecordBatch]) -> usize {
 pub fn recorded_sql(queries: &Arc<Mutex<Vec<String>>>) -> String {
     queries.lock().unwrap().join("\n").to_lowercase()
 }
+
+/// Register `schema` under `name` in the default catalog of `state`.
+///
+/// Unlike [`overwrite_default_schema`], this leaves room for more than
+/// one, which is what a cross-engine test needs: two federated schemas
+/// with different compute contexts, so a join between them cannot be
+/// folded into a single remote query.
+pub fn register_named_schema(state: &SessionState, name: &str, schema: Arc<dyn SchemaProvider>) {
+    let options = &state.config().options().catalog;
+    let catalog = state
+        .catalog_list()
+        .catalog(options.default_catalog.as_str())
+        .expect("default catalog");
+    catalog
+        .register_schema(name, schema)
+        .expect("register schema");
+}
+
+/// A federation-enabled context holding two independent "remote
+/// databases", as schemas `alpha` and `beta`.
+///
+/// Each records the SQL it is sent, and the two report different compute
+/// contexts, so federation must plan them as separate remote queries
+/// joined locally.
+pub async fn two_remotes(
+) -> (SessionContext, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
+    let alpha_exec = RecordingSQLExecutor::new("alpha", "alpha_ctx", remote_ctx("test", "test.csv").await);
+    let beta_exec =
+        RecordingSQLExecutor::new("beta", "beta_ctx", remote_ctx("test2", "test2.csv").await);
+    let (alpha_sql, beta_sql) = (alpha_exec.queries(), beta_exec.queries());
+
+    let alpha = schema_provider(Arc::new(alpha_exec), &["test"]).await;
+    let beta = schema_provider(Arc::new(beta_exec), &["test2"]).await;
+
+    let state = datafusion_federation::default_session_state();
+    register_named_schema(&state, "alpha", alpha);
+    register_named_schema(&state, "beta", beta);
+
+    (SessionContext::new_with_state(state), alpha_sql, beta_sql)
+}

@@ -154,8 +154,19 @@ impl FederationOptimizerRule {
         let exprs_result = self.scan_plan_exprs(plan)?;
         let optimize_expressions = exprs_result.is_some();
 
-        // Return early if this is a leaf and there is no ambiguity with the expressions.
-        if leaf_provider.is_some() && (exprs_result.is_none() || exprs_result == leaf_provider) {
+        // Return early if this is a leaf and there is no ambiguity with the
+        // expressions: the largest federatable sub-plan is higher up, and the
+        // parent will federate it.
+        //
+        // Unless the leaf *is* the root. Then there is no parent to do it, and
+        // returning early leaves the scan unfederated — which surfaces later as
+        // "FederatedTableProviderAdaptor cannot scan". A bare `TableScan` root
+        // is what `SELECT * FROM t` optimizes to once the no-op projection
+        // above it has been removed.
+        if !is_root
+            && leaf_provider.is_some()
+            && (exprs_result.is_none() || exprs_result == leaf_provider)
+        {
             return Ok((None, leaf_provider.into()));
         }
         // Aggregate leaf & expression providers

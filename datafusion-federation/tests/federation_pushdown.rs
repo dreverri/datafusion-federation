@@ -163,3 +163,67 @@ async fn cross_provider_join() {
         "sqlite remote must not see the postgres table: {sqlite_sql}"
     );
 }
+
+/// A join across two engines cannot be folded into one remote query, so
+/// each side is federated on its own — and each side should still ask
+/// only for the columns the query needs.
+///
+/// It does not. The federation rule is inserted immediately after
+/// `scalar_subquery_to_join`, while `OptimizeProjections` is the *last*
+/// rule DataFusion runs, so when a subtree is federated its `TableScan`
+/// has not yet been narrowed. A single-table query hides this: the whole
+/// plan including its `Projection` is federated, and unparsing that
+/// emits the column list. Only when the parent cannot be federated —
+/// this case — is the bare scan left to unparse as every column.
+///
+/// The cost is proportional to table width. Against a real estate this
+/// was measured at 40x: 1,048 bytes for two columns fetched directly,
+/// 41 KB for the same two columns fetched through a cross-engine join of
+/// a 43-column table.
+#[tokio::test]
+async fn projection_is_pushed_down_across_a_cross_engine_join() {
+    let (ctx, alpha_sql, beta_sql) = support::two_remotes().await;
+
+    let batches = support::collect(
+        ctx.sql("SELECT a.foo FROM alpha.test a JOIN beta.test2 b ON b.foo = a.foo")
+            .await
+            .expect("plan query"),
+    )
+    .await;
+    assert_eq!(row_count(&batches), 3, "both sides have the same 3 keys");
+
+    // Only `foo` is needed on either side; `bar` is never referenced.
+    let alpha = recorded_sql(&alpha_sql);
+    let beta = recorded_sql(&beta_sql);
+    assert!(
+        !alpha.contains("bar"),
+        "alpha fetched a column the query never uses: {alpha}"
+    );
+    assert!(
+        !beta.contains("bar"),
+        "beta fetched a column the query never uses: {beta}"
+    );
+}
+
+/// The same join within *one* engine is folded into a single remote
+/// query, and that query is already narrow — because the `Projection`
+/// travels with it. This is the contrast that locates the bug: the
+/// problem is not joins, it is subtrees whose parent cannot be
+/// federated.
+#[tokio::test]
+async fn projection_is_already_pushed_within_one_engine() {
+    let ctx = remote_ctx("test", "test.csv").await;
+    let executor = RecordingSQLExecutor::new("sqlite", "sqlite_exec", ctx);
+    let queries = executor.queries();
+    let schema = schema_provider(std::sync::Arc::new(executor), &["test"]).await;
+
+    run_federated(
+        schema,
+        "SELECT a.foo FROM test a JOIN test b ON b.foo = a.foo",
+    )
+    .await;
+
+    let sql = recorded_sql(&queries);
+    assert!(sql.contains("join"), "the join was federated whole: {sql}");
+    assert!(!sql.contains("bar"), "and it is already narrow: {sql}");
+}

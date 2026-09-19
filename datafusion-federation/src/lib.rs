@@ -40,9 +40,9 @@ pub fn default_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     // This ensures ScalarSubquery are replaced before we try to federate.
     let Some(pos) = default_rules
         .iter()
-        .position(|x| x.name() == "scalar_subquery_to_join")
+        .position(|x| x.name() == "optimize_projections")
     else {
-        panic!("Could not locate ScalarSubqueryToJoin");
+        panic!("Could not locate OptimizeProjections");
     };
 
     // TODO: check if we should allow other optimizers to run before the federation rule.
