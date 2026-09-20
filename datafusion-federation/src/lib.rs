@@ -36,8 +36,12 @@ pub fn default_optimizer_rules() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
     let df_default = Optimizer::new();
     let mut default_rules = df_default.rules;
 
-    // Insert the FederationOptimizerRule after the ScalarSubqueryToJoin.
-    // This ensures ScalarSubquery are replaced before we try to federate.
+    // Insert the FederationOptimizerRule after OptimizeProjections, the last rule
+    // DataFusion runs. Federating last means a sub-plan is cut out of a tree whose
+    // projections have already been narrowed, so a federated TableScan asks its
+    // remote only for the columns its parent actually needs. It also keeps
+    // federation after ScalarSubqueryToJoin, so scalar subqueries have been
+    // rewritten into joins before we try to federate.
     let Some(pos) = default_rules
         .iter()
         .position(|x| x.name() == "optimize_projections")

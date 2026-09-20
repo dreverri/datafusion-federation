@@ -201,9 +201,13 @@ pub fn register_named_schema(state: &SessionState, name: &str, schema: Arc<dyn S
 /// Each records the SQL it is sent, and the two report different compute
 /// contexts, so federation must plan them as separate remote queries
 /// joined locally.
-pub async fn two_remotes(
-) -> (SessionContext, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<String>>>) {
-    let alpha_exec = RecordingSQLExecutor::new("alpha", "alpha_ctx", remote_ctx("test", "test.csv").await);
+pub async fn two_remotes() -> (
+    SessionContext,
+    Arc<Mutex<Vec<String>>>,
+    Arc<Mutex<Vec<String>>>,
+) {
+    let alpha_exec =
+        RecordingSQLExecutor::new("alpha", "alpha_ctx", remote_ctx("test", "test.csv").await);
     let beta_exec =
         RecordingSQLExecutor::new("beta", "beta_ctx", remote_ctx("test2", "test2.csv").await);
     let (alpha_sql, beta_sql) = (alpha_exec.queries(), beta_exec.queries());
@@ -216,4 +220,96 @@ pub async fn two_remotes(
     register_named_schema(&state, "beta", beta);
 
     (SessionContext::new_with_state(state), alpha_sql, beta_sql)
+}
+
+/// A context where the table is registered under a *different* name than the
+/// remote knows it by — `local` here, `remote` there.
+///
+/// Every other helper registers each table under its own remote name, which
+/// makes the analyzer's table-scan rewrite an identity and hides any bug in
+/// it. A catalog that addresses tables by a generated id (`t42`) renames every
+/// table it serves, so the rewrite is the normal case there, not the exotic
+/// one.
+pub async fn renamed_remote(
+    local: &str,
+    remote: &str,
+    csv: &str,
+) -> (SessionContext, Arc<Mutex<Vec<String>>>) {
+    use datafusion::{
+        arrow::datatypes::{DataType, Field, Schema},
+        common::TableReference,
+    };
+    use datafusion_federation::{sql::SQLTableSource, FederatedTableProviderAdaptor};
+
+    let executor =
+        RecordingSQLExecutor::new("sqlite", "sqlite_exec", remote_ctx(remote, csv).await);
+    let queries = executor.queries();
+    let provider = Arc::new(SQLFederationProvider::new(Arc::new(executor)));
+    let arrow_schema = Arc::new(Schema::new(vec![
+        Field::new("foo", DataType::Utf8, true),
+        Field::new("bar", DataType::Int64, true),
+    ]));
+    let source = Arc::new(SQLTableSource::new_with_schema(
+        provider,
+        TableReference::bare(remote.to_string()).into(),
+        Arc::clone(&arrow_schema),
+    ));
+
+    // *With* a fallback provider that accepts filter pushdown. Without one,
+    // `push_down_filter` leaves the predicate as a `Filter` node above the
+    // scan, and the analyzer rewrites it on the way past. A provider that
+    // takes the filter moves it into `TableScan.filters` instead, where only
+    // an explicit rewrite reaches it. Every real SQL table provider does
+    // this, so it is the shape that matters.
+    let fallback = Arc::new(PushdownProvider {
+        schema: Arc::clone(&arrow_schema),
+    });
+    let ctx = SessionContext::new_with_state(datafusion_federation::default_session_state());
+    ctx.register_table(
+        local,
+        Arc::new(FederatedTableProviderAdaptor::new_with_provider(
+            source, fallback,
+        )),
+    )
+    .expect("register renamed table");
+    (ctx, queries)
+}
+
+/// A table provider that exists only to claim filters, so that DataFusion
+/// pushes them into the `TableScan` rather than leaving them above it. It is
+/// never scanned: federation replaces it before execution.
+#[derive(Debug)]
+struct PushdownProvider {
+    schema: datafusion::arrow::datatypes::SchemaRef,
+}
+
+#[async_trait]
+impl datafusion::catalog::TableProvider for PushdownProvider {
+    fn schema(&self) -> datafusion::arrow::datatypes::SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> datafusion::logical_expr::TableType {
+        datafusion::logical_expr::TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&datafusion::logical_expr::Expr],
+    ) -> datafusion::error::Result<Vec<datafusion::logical_expr::TableProviderFilterPushDown>> {
+        Ok(vec![
+            datafusion::logical_expr::TableProviderFilterPushDown::Exact;
+            filters.len()
+        ])
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[datafusion::logical_expr::Expr],
+        _limit: Option<usize>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        unreachable!("federation replaces this provider before execution")
+    }
 }

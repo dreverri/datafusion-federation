@@ -56,6 +56,22 @@ fn rewrite_table_scans(
                         .replace_qualifier(remote_table_name.clone());
                     new_table_scan.projected_schema = Arc::new(new_schema);
                     new_table_scan.table_name = remote_table_name;
+
+                    // And the filters the scan carries, which name their
+                    // columns by the *local* table. Leaving them alone
+                    // produces SQL whose FROM says the remote name and
+                    // whose WHERE says the local one — "missing
+                    // FROM-clause entry for table t42" from PostgreSQL.
+                    //
+                    // This was unreachable while federation ran before
+                    // `push_down_filter`, because `filters` was always
+                    // empty by the time a scan was federated. It is not
+                    // empty any more.
+                    new_table_scan.filters = new_table_scan
+                        .filters
+                        .into_iter()
+                        .map(|expr| rewrite_table_scans_in_expr(expr, known_rewrites))
+                        .collect::<Result<Vec<_>>>()?;
                 }
                 None => {
                     // Not a SQLTableSource (is this possible?)

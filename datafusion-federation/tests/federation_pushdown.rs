@@ -227,3 +227,52 @@ async fn projection_is_already_pushed_within_one_engine() {
     assert!(sql.contains("join"), "the join was federated whole: {sql}");
     assert!(!sql.contains("bar"), "and it is already narrow: {sql}");
 }
+
+/// A table registered under a name the remote does not know must have *every*
+/// reference rewritten — the `FROM` clause and the filters alike.
+///
+/// The scan carries its pushed-down filters as a separate field, qualified by
+/// the local table name. Rewriting only `table_name` produces SQL whose `FROM`
+/// says `test` and whose `WHERE` says `t1`, which PostgreSQL rejects with
+/// "missing FROM-clause entry for table t1".
+#[tokio::test]
+async fn a_renamed_table_rewrites_its_filters_too() {
+    let (ctx, queries) = support::renamed_remote("t1", "test", "test.csv").await;
+
+    let batches = support::collect(
+        ctx.sql("SELECT foo FROM t1 WHERE bar > 1")
+            .await
+            .expect("plan query"),
+    )
+    .await;
+
+    assert_eq!(support::row_count(&batches), 2);
+    let sql = support::recorded_sql(&queries);
+    assert!(
+        !sql.contains("t1"),
+        "the local name leaked into the remote SQL: {sql}"
+    );
+    assert!(
+        sql.contains("from test") && sql.contains("test.bar"),
+        "filter should be pushed down against the remote name: {sql}"
+    );
+}
+
+/// The same, under `EXPLAIN ANALYZE`, which executes the plan rather than only
+/// planning it — so a filter left pointing at the local name surfaces as a
+/// remote error instead of a bad plan nobody ran.
+#[tokio::test]
+async fn a_renamed_table_can_be_explained_and_analyzed() {
+    let (ctx, queries) = support::renamed_remote("t1", "test", "test.csv").await;
+
+    support::collect(
+        ctx.sql("EXPLAIN ANALYZE SELECT foo FROM t1 WHERE bar > 1")
+            .await
+            .expect("plan query"),
+    )
+    .await;
+
+    let sql = support::recorded_sql(&queries);
+    assert!(!sql.is_empty(), "the remote was never asked anything");
+    assert!(!sql.contains("t1"), "the local name leaked: {sql}");
+}
