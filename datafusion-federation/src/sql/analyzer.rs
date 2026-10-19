@@ -192,6 +192,34 @@ pub fn rewrite_column_name_in_expr(
     }
 }
 
+/// `name` with every known table used as a qualifier (`table.`) replaced
+/// by its rewrite, where the table isn't the tail of a longer name.
+fn rewrite_qualifiers_in_name(
+    name: &str,
+    known_rewrites: &HashMap<TableReference, TableReference>,
+) -> String {
+    known_rewrites
+        .iter()
+        .fold(name.to_string(), |name, (table_ref, rewrite)| {
+            let from = format!("{table_ref}.");
+            let to = format!("{rewrite}.");
+            let mut out = String::with_capacity(name.len());
+            let mut rest = name.as_str();
+            while let Some(idx) = rest.find(&from) {
+                let continues_a_name = rest[..idx]
+                    .chars()
+                    .next_back()
+                    .or_else(|| out.chars().next_back())
+                    .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '.');
+                out.push_str(&rest[..idx]);
+                out.push_str(if continues_a_name { &from } else { &to });
+                rest = &rest[idx + from.len()..];
+            }
+            out.push_str(rest);
+            out
+        })
+}
+
 fn rewrite_table_scans_in_expr(
     expr: Expr,
     known_rewrites: &mut HashMap<TableReference, TableReference>,
@@ -263,7 +291,18 @@ fn rewrite_table_scans_in_expr(
                     )));
                 }
             }
-            Ok(Expr::Alias(Alias::new(expr, alias.relation, alias.name)))
+            // An unqualified alias can carry a display name that names the
+            // table, e.g. `length(app_table.b)`, which the optimizer keeps
+            // when it rewrites the expression under it. A parent refers to
+            // it by that name, and the parent's column name is rewritten
+            // above, so the alias must match. Only a qualifier — the table
+            // followed by `.` — is rewritten: an alias that merely equals
+            // the table's name is the user's and stays.
+            let name = match alias.relation {
+                None => rewrite_qualifiers_in_name(&alias.name, known_rewrites),
+                Some(_) => alias.name,
+            };
+            Ok(Expr::Alias(Alias::new(expr, alias.relation, name)))
         }
         Expr::Like(like) => {
             let expr = rewrite_table_scans_in_expr(*like.expr, known_rewrites)?;
@@ -892,6 +931,33 @@ mod tests {
         for test in tests {
             test_sql(&ctx, test.0, test.1).await?;
         }
+
+        Ok(())
+    }
+
+    /// The optimizer can leave an alias that keeps an expression's
+    /// original display name inside an aggregate, e.g.
+    /// `min(character_length(app_table.b) AS length(app_table.b))`. The
+    /// aggregate's output is then named from the alias, and a parent
+    /// refers to it by that name, unqualified. The parent's column name is
+    /// rewritten to the remote table, so the alias has to be too, or the
+    /// parent asks for a field the aggregate no longer has.
+    #[tokio::test]
+    async fn test_rewrite_table_scans_optimized_aggregate_over_function() -> Result<()> {
+        init_tracing();
+        let ctx = get_test_df_context();
+
+        let plan = ctx
+            .sql("SELECT MIN(length(b)) AS n FROM app_table")
+            .await?
+            .into_optimized_plan()?;
+        let rewritten_plan = RewriteTableScanAnalyzer::rewrite(plan)?;
+        let unparsed_sql = plan_to_sql(&rewritten_plan)?;
+
+        assert_eq!(
+            format!("{unparsed_sql}"),
+            r#"SELECT min(character_length(remote_table.b)) AS n FROM remote_table"#
+        );
 
         Ok(())
     }
